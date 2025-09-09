@@ -1,0 +1,71 @@
+name: Ingesta Drive
+on:
+  workflow_dispatch:
+    inputs:
+      mode: { description: "gen_checklist | procesar", default: gen_checklist, required: true }
+      batch_size: { description: "N archivos a procesar", default: "5", required: false }
+permissions: { contents: write }
+jobs:
+  gen-checklist:
+    if: ${{ github.event.inputs.mode == 'gen_checklist' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y rclone jq
+      - name: Setup rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONFIG }}" > ~/.config/rclone/rclone.conf
+      - name: Generar checklist
+        env: { DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }} }
+        run: |
+          bash tools/ingesta/gen_checklist_rclone.sh "gdrive:${DRIVE_FOLDER_ID}" docs/ingesta/_NEW.txt
+          touch docs/ingesta/CHECKLIST.txt
+          python3 - << 'PY'
+import io,re
+old=io.open('docs/ingesta/CHECKLIST.txt','r',encoding='utf-8').read().splitlines()
+new=io.open('docs/ingesta/_NEW.txt','r',encoding='utf-8').read().splitlines()
+checked=set([l[4:] for l in old if l.startswith('[x] ')])
+merged=[('[x] ' if l[4:] in checked else '[ ] ')+l[4:] for l in new]
+io.open('docs/ingesta/CHECKLIST.txt','w',encoding='utf-8').write('\n'.join(merged)+'\n')
+PY
+      - run: |
+          git config user.name "ingesta-bot"
+          git config user.email "ingesta-bot@users.noreply.github.com"
+          git add docs/ingesta/CHECKLIST.txt || true
+          git commit -m "Ingesta: refresco CHECKLIST" || exit 0
+          git push
+  procesar:
+    if: ${{ github.event.inputs.mode == 'procesar' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y rclone jq python3-pip
+      - run: pip3 install requests python-docx
+      - name: Setup rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONFIG }}" > ~/.config/rclone/rclone.conf
+      - name: Procesar lote
+        env:
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BATCH: ${{ github.event.inputs.batch_size }}
+        run: |
+          mkdir -p docs/Consolidados
+          for i in $(seq 1 ${BATCH:-5}); do
+            ITEM=$(python3 tools/ingesta/next_unchecked.py docs/ingesta/CHECKLIST.txt)
+            [ "$ITEM" = "COMPLETO" ] && break
+            FILE="${ITEM%% - *}"; PATH_REL="${ITEM#* - }"
+            echo ">> $FILE — $PATH_REL"
+            bash tools/ingesta/pull_file.sh "gdrive:${DRIVE_FOLDER_ID}/${PATH_REL}${FILE}" workfile
+            python3 tools/ingesta/run_llm.py workfile
+            python3 tools/ingesta/render_from_json.py "$FILE" "$PATH_REL"
+            python3 tools/ingesta/mark_checked.py docs/ingesta/CHECKLIST.txt "$FILE - $PATH_REL"
+          done
+      - run: |
+          git config user.name "ingesta-bot"
+          git config user.email "ingesta-bot@users.noreply.github.com"
+          git add docs/Consolidados CHANGELOG.md docs/ingesta/CHECKLIST.txt || true
+          git commit -m "Ingesta: procesados por lote" || exit 0
+          git push
